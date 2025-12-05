@@ -100,7 +100,7 @@ var upgrader = websocket.Upgrader{
 }
 
 func StartServer(hub *Hub, w http.ResponseWriter, r *http.Request) {
-	conn, err := upgrader.Upgrade(w, r, nil) //http升级为websocket协议
+	conn, err := upgrader.Upgrade(w, r, nil) // 将 Http 升级为 WebSocket协议
 	if err != nil {
 		fmt.Printf("升级 http 协议失败, err : %s\n", err)
 		return
