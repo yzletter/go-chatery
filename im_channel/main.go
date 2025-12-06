@@ -20,7 +20,7 @@ func main() {
 
 	engine := gin.Default()
 
-	engine.GET("/", loadHomePage) // 首页路由
+	engine.GET("/", loadHomePage)                // 首页路由
 	engine.GET("/chat", func(ctx *gin.Context) { // 启动聊天
 		StartServer(hub, ctx.Writer, ctx.Request)
 	})
