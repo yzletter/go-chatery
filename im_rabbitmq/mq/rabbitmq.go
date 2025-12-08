@@ -88,7 +88,11 @@ func (mq *RabbitMQService) Produce(message *common.Message, uid int) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	fmt.Printf("向 %s 写入 %s\n", exchangeName, msg)
+	// 由发送方写入数据库
+	if uid == message.From {
+		mysql.DB.Create(&message)
+	}
+
 	_ = mq.mqChannel.PublishWithContext(
 		ctx,
 		exchangeName,
@@ -106,7 +110,7 @@ func (mq *RabbitMQService) Produce(message *common.Message, uid int) error {
 }
 
 // Consume 从 RabbitMQ 中获得读消息
-func (mq *RabbitMQService) Consume(uid int, window chan common.Message) {
+func (mq *RabbitMQService) Consume(uid int, targetId int, window chan common.Message) {
 	queueName := fmt.Sprintf("%d_queue", uid)
 
 	deliverCh, _ := mq.mqChannel.Consume(queueName, "", false, false, false, false, nil)
@@ -115,13 +119,10 @@ func (mq *RabbitMQService) Consume(uid int, window chan common.Message) {
 			var message common.Message
 			_ = json.Unmarshal(deliver.Body, &message)
 
-			// 由发送方写入数据库
-			if uid == message.From {
-				mysql.DB.Create(&message)
+			if targetId == message.From || targetId == message.To {
+				window <- message
+				deliver.Ack(false)
 			}
-
-			window <- message
-			deliver.Ack(false)
 		}
 	}()
 }

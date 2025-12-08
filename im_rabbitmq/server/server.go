@@ -53,17 +53,18 @@ func (handler *UserHandler) Speak(ctx *gin.Context) {
 	// 心跳保持
 	go heartBeat(conn) //心跳保持
 
-	uid, _ := strconv.Atoi(ctx.Query("id"))
+	uid, _ := strconv.Atoi(ctx.Param("id"))
+	targetId, _ := strconv.Atoi(ctx.Param("target"))
 
 	window := make(chan common.Message, 100)
 
-	handler.RabbitMQService.Consume(uid, window)
+	handler.RabbitMQService.Consume(uid, targetId, window)
 
-	go handler.Receive(uid, conn, window)
+	go handler.Receive(uid, targetId, conn, window)
 	go handler.Send(conn)
 }
 
-func (handler *UserHandler) Receive(uid int, conn *websocket.Conn, window chan common.Message) {
+func (handler *UserHandler) Receive(uid int, targetId int, conn *websocket.Conn, window chan common.Message) {
 	defer func() {
 		err := conn.Close() // 错误忽略
 		if err != nil {
@@ -74,7 +75,7 @@ func (handler *UserHandler) Receive(uid int, conn *websocket.Conn, window chan c
 
 	// 拉取历史消息
 	var msgs []common.Message
-	mysql.DB.Model(&common.Message{}).Where("`from` = ?", uid).Or("`to` = ?", uid).Find(&msgs)
+	mysql.DB.Model(&common.Message{}).Where("`from` = ? and `to` = ?", uid, targetId).Or("`from` = ? and `to` = ?", targetId, uid).Find(&msgs)
 
 	// 按时间排序
 	sort.Slice(msgs, func(i, j int) bool {

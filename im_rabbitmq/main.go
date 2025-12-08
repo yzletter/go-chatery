@@ -33,7 +33,7 @@ func main() {
 	UserHdl := server.NewUserHandler(RabbitMQSvc)
 
 	engine.GET("/register", UserHdl.Register)
-	engine.GET("/speak", UserHdl.Speak)
+	engine.GET("/speak/:id/:target", UserHdl.Speak)
 	if err := engine.Run("localhost:8081"); err != nil {
 		fmt.Println("服务启动失败")
 		panic(err)
