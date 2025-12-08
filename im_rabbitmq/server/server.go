@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -12,13 +13,14 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/yzletter/go-chatery/im_rabbitmq/common"
 	"github.com/yzletter/go-chatery/im_rabbitmq/mq"
+	"github.com/yzletter/go-chatery/im_rabbitmq/mysql"
 )
 
 // HTTP 升级器
 var upgrader = websocket.Upgrader{
-	HandshakeTimeout: 1 * time.Second,
-	ReadBufferSize:   100,
-	WriteBufferSize:  100,
+	HandshakeTimeout: 10 * time.Second,
+	ReadBufferSize:   10000,
+	WriteBufferSize:  10000,
 	CheckOrigin: func(r *http.Request) bool {
 		return true
 	},
@@ -47,32 +49,69 @@ func (handler *UserHandler) Speak(ctx *gin.Context) {
 		fmt.Println(err)
 		return
 	}
-	defer func() {
-		_ = conn.Close() // 错误忽略
-	}()
 
 	// 心跳保持
 	go heartBeat(conn) //心跳保持
 
 	uid, _ := strconv.Atoi(ctx.Query("id"))
 
-	window := make(chan []byte, 100)
+	window := make(chan common.Message, 100)
 
 	handler.RabbitMQService.Consume(uid, window)
 
-	go func(conn *websocket.Conn) {
-		for {
-			msg := <-window
-			fmt.Printf("msg 为%s\n", msg)
+	go handler.Receive(uid, conn, window)
+	go handler.Send(conn)
+}
 
-			var message common.Message
-			_ = json.Unmarshal(msg, &message)
-			_ = conn.WriteJSON(message)
+func (handler *UserHandler) Receive(uid int, conn *websocket.Conn, window chan common.Message) {
+	defer func() {
+		err := conn.Close() // 错误忽略
+		if err != nil {
+			fmt.Println(err)
+			return
 		}
-	}(conn)
+	}()
 
+	// 拉取历史消息
+	var msgs []common.Message
+	mysql.DB.Model(&common.Message{}).Where("`from` = ?", uid).Or("`to` = ?", uid).Find(&msgs)
+
+	// 按时间排序
+	sort.Slice(msgs, func(i, j int) bool {
+		return msgs[i].Time > msgs[j].Time
+	})
+
+	if len(msgs) > 3 {
+		msgs = msgs[:3]
+	}
+
+	Set := make(map[common.Message]struct{})
+
+	for _, msg := range msgs {
+		Set[msg] = struct{}{}
+		printToFrontend(conn, msg)
+	}
+
+	// 从 window 中读取数据
 	for {
-		// 接受用户的消息, 打给 RabbitMQ
+		msg := <-window
+		if _, exits := Set[msg]; !exits {
+			Set[msg] = struct{}{}
+			printToFrontend(conn, msg)
+		}
+	}
+}
+
+// Send 接受用户的消息, 打给 RabbitMQ
+func (handler *UserHandler) Send(conn *websocket.Conn) {
+	defer func() {
+		err := conn.Close() // 错误忽略
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+	}()
+	for {
 		_, body, err := conn.ReadMessage()
 		if err != nil {
 			fmt.Println(err)
@@ -89,12 +128,11 @@ func (handler *UserHandler) Speak(ctx *gin.Context) {
 		if !ok {
 			continue // 略过此条消息不发给 RabbitMQ
 		}
-		fmt.Println(msg)
+
 		// 将消息分别发给 msg.To 和 msg.From
 		_ = handler.RabbitMQService.Produce(&msg, msg.To)
 		_ = handler.RabbitMQService.Produce(&msg, msg.From)
 	}
-
 }
 
 // intercept 进行消息过滤
@@ -132,4 +170,8 @@ LOOP:
 		deadline := time.Now().Add(pongWait) // ping发出去以后，期望5秒之内从conn里能计到数据（至少能读到pong）
 		conn.SetReadDeadline(deadline)
 	}
+}
+
+func printToFrontend(conn *websocket.Conn, msg common.Message) {
+	_ = conn.WriteJSON(msg)
 }

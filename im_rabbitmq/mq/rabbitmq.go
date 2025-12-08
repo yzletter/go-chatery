@@ -4,12 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"sync"
 	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 	"github.com/yzletter/go-chatery/im_rabbitmq/common"
+	"github.com/yzletter/go-chatery/im_rabbitmq/mysql"
 )
 
 var mqOnce sync.Once
@@ -106,17 +106,29 @@ func (mq *RabbitMQService) Produce(message *common.Message, uid int) error {
 }
 
 // Consume 从 RabbitMQ 中获得读消息
-func (mq *RabbitMQService) Consume(uid int, window chan []byte) {
+func (mq *RabbitMQService) Consume(uid int, window chan common.Message) {
 	queueName := fmt.Sprintf("%d_queue", uid)
 
 	deliverCh, _ := mq.mqChannel.Consume(queueName, "", false, false, false, false, nil)
 	go func() {
-		log.Printf("开始消费队列%s\n", queueName)
 		for deliver := range deliverCh {
-			fmt.Printf("deliver.Body 为 %v\n", deliver.Body)
+			var message common.Message
+			_ = json.Unmarshal(deliver.Body, &message)
 
-			window <- deliver.Body
+			mysql.DB.Create(&message)
+			fmt.Printf("%d %s\n", uid, message)
+			window <- message
 			deliver.Ack(false)
 		}
 	}()
+}
+
+// 释放MQ连接
+func (mq *RabbitMQService) Release() {
+	if mq.mqChannel != nil {
+		mq.mqChannel.Close()
+	}
+	if mq.mqConn != nil {
+		mq.mqConn.Close()
+	}
 }

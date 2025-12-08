@@ -1,0 +1,376 @@
+Index: im_rabbitmq/server/server.go
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.BaseRevisionTextPatchEP
+<+>package server\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"net/http\"\n\t\"sort\"\n\t\"strconv\"\n\t\"strings\"\n\t\"time\"\n\n\t\"github.com/gin-gonic/gin\"\n\t\"github.com/gorilla/websocket\"\n\t\"github.com/yzletter/go-chatery/im_rabbitmq/common\"\n\t\"github.com/yzletter/go-chatery/im_rabbitmq/mq\"\n\t\"github.com/yzletter/go-chatery/im_rabbitmq/mysql\"\n)\n\n// HTTP 升级器\nvar upgrader = websocket.Upgrader{\n\tHandshakeTimeout: 10 * time.Second,\n\tReadBufferSize:   10000,\n\tWriteBufferSize:  10000,\n\tCheckOrigin: func(r *http.Request) bool {\n\t\treturn true\n\t},\n}\n\ntype UserHandler struct {\n\tRabbitMQService *mq.RabbitMQService\n}\n\nfunc NewUserHandler(rabbitMQService *mq.RabbitMQService) *UserHandler {\n\treturn &UserHandler{\n\t\tRabbitMQService: rabbitMQService,\n\t}\n}\n\nfunc (handler *UserHandler) Register(ctx *gin.Context) {\n\tuid, _ := strconv.Atoi(ctx.Query(\"id\"))\n\thandler.RabbitMQService.RegisterUser(uid)\n}\n\n// Speak 建立 WebSocket 连接, 并不断读取消息\nfunc (handler *UserHandler) Speak(ctx *gin.Context) {\n\t// 升级 Http\n\tconn, err := upgrader.Upgrade(ctx.Writer, ctx.Request, nil)\n\tif err != nil {\n\t\tfmt.Println(err)\n\t\treturn\n\t}\n\n\tdefer func() {\n\t\t_ = conn.Close() // 错误忽略\n\t}()\n\n\t// 心跳保持\n\tgo heartBeat(conn) //心跳保持\n\n\tuid, _ := strconv.Atoi(ctx.Query(\"id\"))\n\n\twindow := make(chan common.Message, 100)\n\n\thandler.RabbitMQService.Consume(uid, window)\n\n\tgo handler.Receive(uid, conn, window)\n\tgo handler.Send(conn)\n}\n\nfunc (handler *UserHandler) Receive(uid int, conn *websocket.Conn, window chan common.Message) {\n\t// 拉取历史消息\n\tvar msgs []common.Message\n\tmysql.DB.Model(&common.Message{}).Where(\"`from` = ?\", uid).Or(\"`to` = ?\", uid).Find(&msgs)\n\n\t// 按时间排序\n\tsort.Slice(msgs, func(i, j int) bool {\n\t\treturn msgs[i].Time < msgs[j].Time\n\t})\n\n\tSet := make(map[common.Message]struct{})\n\n\tfor _, msg := range msgs {\n\t\tprintToFrontend(conn, msg)\n\t}\n\n\t// 从 window 中读取数据\n\tfor {\n\t\tmsg := <-window\n\t\tif _, exits := Set[msg]; !exits {\n\t\t\tSet[msg] = struct{}{}\n\t\t\tprintToFrontend(conn, msg)\n\t\t}\n\t}\n}\n\n// Send 接受用户的消息, 打给 RabbitMQ\nfunc (handler *UserHandler) Send(conn *websocket.Conn) {\n\tfor {\n\t\t_, body, err := conn.ReadMessage()\n\t\tif err != nil {\n\t\t\tfmt.Println(err)\n\t\t\treturn\n\t\t}\n\n\t\tvar msg common.Message\n\t\t_ = json.Unmarshal(body, &msg)                            // 把 body 解析到 msg 中\n\t\tmsg.Content = strings.ReplaceAll(msg.Content, \"\\n\", \"  \") // 换行符用空格代替。将来要用换行符来分隔每条Message，所以一条Message内部不能出现换行符\n\t\tmsg.Id = int(time.Now().UnixMicro())\n\t\tmsg.Time = int(time.Now().UnixMicro())\n\n\t\tok := intercept(msg.Content) // 处理消息内容, 正常应进行对非法内容进行拦截。比如机器人消息（发言频率过快）；包含欺诈、涉政等违规内容；涉嫌私下联系/交易等。\n\t\tif !ok {\n\t\t\tcontinue // 略过此条消息不发给 RabbitMQ\n\t\t}\n\n\t\t// 将消息分别发给 msg.To 和 msg.From\n\t\t_ = handler.RabbitMQService.Produce(&msg, msg.To)\n\t\t_ = handler.RabbitMQService.Produce(&msg, msg.From)\n\t}\n}\n\n// intercept 进行消息过滤\nfunc intercept(content string) bool {\n\tif len(content) == 0 {\n\t\treturn false\n\t}\n\treturn true\n}\n\nvar (\n\tpongWait   = 5 * time.Second //等待pong的超时时间\n\tpingPeriod = 3 * time.Second //发送ping的周期，必须短于pongWait\n)\n\nfunc heartBeat(conn *websocket.Conn) {\n\tconn.SetPongHandler(func(appData string) error {\n\t\treturn nil\n\t})\n\n\terr := conn.WriteMessage(websocket.PingMessage, nil)\n\tif err != nil {\n\t\tconn.WriteMessage(websocket.CloseMessage, nil)\n\t}\n\n\tticker := time.NewTicker(pingPeriod)\nLOOP:\n\tfor {\n\t\t<-ticker.C\n\t\terr := conn.WriteMessage(websocket.PingMessage, nil)\n\t\tif err != nil {\n\t\t\tconn.WriteMessage(websocket.CloseMessage, nil)\n\t\t\tbreak LOOP\n\t\t}\n\t\tdeadline := time.Now().Add(pongWait) // ping发出去以后，期望5秒之内从conn里能计到数据（至少能读到pong）\n\t\tconn.SetReadDeadline(deadline)\n\t}\n}\n\nfunc printToFrontend(conn *websocket.Conn, msg common.Message) {\n\t_ = conn.WriteJSON(msg)\n}\n
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/im_rabbitmq/server/server.go b/im_rabbitmq/server/server.go
+--- a/im_rabbitmq/server/server.go	(revision 6ed41c39989e99692294b4c7377a28def9f527cb)
++++ b/im_rabbitmq/server/server.go	(date 1765201514800)
+@@ -1,161 +1,8 @@
+ package server
+ 
+-import (
+-	"encoding/json"
+-	"fmt"
+-	"net/http"
+-	"sort"
+-	"strconv"
+-	"strings"
+-	"time"
+-
+-	"github.com/gin-gonic/gin"
+-	"github.com/gorilla/websocket"
+-	"github.com/yzletter/go-chatery/im_rabbitmq/common"
+-	"github.com/yzletter/go-chatery/im_rabbitmq/mq"
+-	"github.com/yzletter/go-chatery/im_rabbitmq/mysql"
+-)
+-
+-// HTTP 升级器
+-var upgrader = websocket.Upgrader{
+-	HandshakeTimeout: 10 * time.Second,
+-	ReadBufferSize:   10000,
+-	WriteBufferSize:  10000,
+-	CheckOrigin: func(r *http.Request) bool {
+-		return true
+-	},
+-}
+-
+-type UserHandler struct {
+-	RabbitMQService *mq.RabbitMQService
+-}
+-
+-func NewUserHandler(rabbitMQService *mq.RabbitMQService) *UserHandler {
+-	return &UserHandler{
+-		RabbitMQService: rabbitMQService,
+-	}
+-}
+-
+-func (handler *UserHandler) Register(ctx *gin.Context) {
+-	uid, _ := strconv.Atoi(ctx.Query("id"))
+-	handler.RabbitMQService.RegisterUser(uid)
+-}
+-
+-// Speak 建立 WebSocket 连接, 并不断读取消息
+-func (handler *UserHandler) Speak(ctx *gin.Context) {
+-	// 升级 Http
+-	conn, err := upgrader.Upgrade(ctx.Writer, ctx.Request, nil)
+-	if err != nil {
+-		fmt.Println(err)
+-		return
+-	}
+-
+-	defer func() {
+-		_ = conn.Close() // 错误忽略
+-	}()
+-
+-	// 心跳保持
+-	go heartBeat(conn) //心跳保持
+-
+-	uid, _ := strconv.Atoi(ctx.Query("id"))
+-
+-	window := make(chan common.Message, 100)
+-
+-	handler.RabbitMQService.Consume(uid, window)
+-
+-	go handler.Receive(uid, conn, window)
+-	go handler.Send(conn)
+-}
+-
+-func (handler *UserHandler) Receive(uid int, conn *websocket.Conn, window chan common.Message) {
+-	// 拉取历史消息
+-	var msgs []common.Message
+-	mysql.DB.Model(&common.Message{}).Where("`from` = ?", uid).Or("`to` = ?", uid).Find(&msgs)
+-
+-	// 按时间排序
+-	sort.Slice(msgs, func(i, j int) bool {
+-		return msgs[i].Time < msgs[j].Time
+-	})
+-
+-	Set := make(map[common.Message]struct{})
+-
+-	for _, msg := range msgs {
+-		printToFrontend(conn, msg)
+-	}
+-
+-	// 从 window 中读取数据
+-	for {
+-		msg := <-window
+-		if _, exits := Set[msg]; !exits {
+-			Set[msg] = struct{}{}
+-			printToFrontend(conn, msg)
+-		}
+-	}
+-}
+-
+-// Send 接受用户的消息, 打给 RabbitMQ
+-func (handler *UserHandler) Send(conn *websocket.Conn) {
+-	for {
+-		_, body, err := conn.ReadMessage()
+-		if err != nil {
+-			fmt.Println(err)
+-			return
+-		}
+-
+-		var msg common.Message
+-		_ = json.Unmarshal(body, &msg)                            // 把 body 解析到 msg 中
+-		msg.Content = strings.ReplaceAll(msg.Content, "\n", "  ") // 换行符用空格代替。将来要用换行符来分隔每条Message，所以一条Message内部不能出现换行符
+-		msg.Id = int(time.Now().UnixMicro())
+-		msg.Time = int(time.Now().UnixMicro())
+-
+-		ok := intercept(msg.Content) // 处理消息内容, 正常应进行对非法内容进行拦截。比如机器人消息（发言频率过快）；包含欺诈、涉政等违规内容；涉嫌私下联系/交易等。
+-		if !ok {
+-			continue // 略过此条消息不发给 RabbitMQ
+-		}
++import "github.com/gin-gonic/gin"
+ 
+-		// 将消息分别发给 msg.To 和 msg.From
+-		_ = handler.RabbitMQService.Produce(&msg, msg.To)
+-		_ = handler.RabbitMQService.Produce(&msg, msg.From)
++func Register() gin.HandlerFunc {
++	return func(ctx *gin.Context) {
+ 	}
+ }
+-
+-// intercept 进行消息过滤
+-func intercept(content string) bool {
+-	if len(content) == 0 {
+-		return false
+-	}
+-	return true
+-}
+-
+-var (
+-	pongWait   = 5 * time.Second //等待pong的超时时间
+-	pingPeriod = 3 * time.Second //发送ping的周期，必须短于pongWait
+-)
+-
+-func heartBeat(conn *websocket.Conn) {
+-	conn.SetPongHandler(func(appData string) error {
+-		return nil
+-	})
+-
+-	err := conn.WriteMessage(websocket.PingMessage, nil)
+-	if err != nil {
+-		conn.WriteMessage(websocket.CloseMessage, nil)
+-	}
+-
+-	ticker := time.NewTicker(pingPeriod)
+-LOOP:
+-	for {
+-		<-ticker.C
+-		err := conn.WriteMessage(websocket.PingMessage, nil)
+-		if err != nil {
+-			conn.WriteMessage(websocket.CloseMessage, nil)
+-			break LOOP
+-		}
+-		deadline := time.Now().Add(pongWait) // ping发出去以后，期望5秒之内从conn里能计到数据（至少能读到pong）
+-		conn.SetReadDeadline(deadline)
+-	}
+-}
+-
+-func printToFrontend(conn *websocket.Conn, msg common.Message) {
+-	_ = conn.WriteJSON(msg)
+-}
+Index: go.sum
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.BaseRevisionTextPatchEP
+<+>filippo.io/edwards25519 v1.1.0 h1:FNf4tywRC1HmFuKW5xopWpigGjJKiJSV0Cqo0cJWDaA=\nfilippo.io/edwards25519 v1.1.0/go.mod h1:BxyFTGdWcka3PhytdK4V28tE5sGfRvvvRV7EaN4VDT4=\ngithub.com/bytedance/sonic v1.14.0 h1:/OfKt8HFw0kh2rj8N0F6C/qPGRESq0BbaNZgcNXXzQQ=\ngithub.com/bytedance/sonic v1.14.0/go.mod h1:WoEbx8WTcFJfzCe0hbmyTGrfjt8PzNEBdxlNUO24NhA=\ngithub.com/bytedance/sonic/loader v0.3.0 h1:dskwH8edlzNMctoruo8FPTJDF3vLtDT0sXZwvZJyqeA=\ngithub.com/bytedance/sonic/loader v0.3.0/go.mod h1:N8A3vUdtUebEY2/VQC0MyhYeKUFosQU6FxH2JmUe6VI=\ngithub.com/cloudwego/base64x v0.1.6 h1:t11wG9AECkCDk5fMSoxmufanudBtJ+/HemLstXDLI2M=\ngithub.com/cloudwego/base64x v0.1.6/go.mod h1:OFcloc187FXDaYHvrNIjxSe8ncn0OOM8gEHfghB2IPU=\ngithub.com/davecgh/go-spew v1.1.0/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=\ngithub.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=\ngithub.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=\ngithub.com/gabriel-vasile/mimetype v1.4.8 h1:FfZ3gj38NjllZIeJAmMhr+qKL8Wu+nOoI3GqacKw1NM=\ngithub.com/gabriel-vasile/mimetype v1.4.8/go.mod h1:ByKUIKGjh1ODkGM1asKUbQZOLGrPjydw3hYPU2YU9t8=\ngithub.com/gin-contrib/sse v1.1.0 h1:n0w2GMuUpWDVp7qSpvze6fAu9iRxJY4Hmj6AmBOU05w=\ngithub.com/gin-contrib/sse v1.1.0/go.mod h1:hxRZ5gVpWMT7Z0B0gSNYqqsSCNIJMjzvm6fqCz9vjwM=\ngithub.com/gin-gonic/gin v1.11.0 h1:OW/6PLjyusp2PPXtyxKHU0RbX6I/l28FTdDlae5ueWk=\ngithub.com/gin-gonic/gin v1.11.0/go.mod h1:+iq/FyxlGzII0KHiBGjuNn4UNENUlKbGlNmc+W50Dls=\ngithub.com/go-playground/assert/v2 v2.2.0 h1:JvknZsQTYeFEAhQwI4qEt9cyV5ONwRHC+lYKSsYSR8s=\ngithub.com/go-playground/assert/v2 v2.2.0/go.mod h1:VDjEfimB/XKnb+ZQfWdccd7VUvScMdVu0Titje2rxJ4=\ngithub.com/go-playground/locales v0.14.1 h1:EWaQ/wswjilfKLTECiXz7Rh+3BjFhfDFKv/oXslEjJA=\ngithub.com/go-playground/locales v0.14.1/go.mod h1:hxrqLVvrK65+Rwrd5Fc6F2O76J/NuW9t0sjnWqG1slY=\ngithub.com/go-playground/universal-translator v0.18.1 h1:Bcnm0ZwsGyWbCzImXv+pAJnYK9S473LQFuzCbDbfSFY=\ngithub.com/go-playground/universal-translator v0.18.1/go.mod h1:xekY+UJKNuX9WP91TpwSH2VMlDf28Uj24BCp08ZFTUY=\ngithub.com/go-playground/validator/v10 v10.27.0 h1:w8+XrWVMhGkxOaaowyKH35gFydVHOvC0/uWoy2Fzwn4=\ngithub.com/go-playground/validator/v10 v10.27.0/go.mod h1:I5QpIEbmr8On7W0TktmJAumgzX4CA1XNl4ZmDuVHKKo=\ngithub.com/go-sql-driver/mysql v1.8.1 h1:LedoTUt/eveggdHS9qUFC1EFSa8bU2+1pZjSRpvNJ1Y=\ngithub.com/go-sql-driver/mysql v1.8.1/go.mod h1:wEBSXgmK//2ZFJyE+qWnIsVGmvmEKlqwuVSjsCm7DZg=\ngithub.com/goccy/go-json v0.10.2 h1:CrxCmQqYDkv1z7lO7Wbh2HN93uovUHgrECaO5ZrCXAU=\ngithub.com/goccy/go-json v0.10.2/go.mod h1:6MelG93GURQebXPDq3khkgXZkazVtN9CRI+MGFi0w8I=\ngithub.com/goccy/go-yaml v1.18.0 h1:8W7wMFS12Pcas7KU+VVkaiCng+kG8QiFeFwzFb+rwuw=\ngithub.com/goccy/go-yaml v1.18.0/go.mod h1:XBurs7gK8ATbW4ZPGKgcbrY1Br56PdM69F7LkFRi1kA=\ngithub.com/google/go-cmp v0.7.0 h1:wk8382ETsv4JYUZwIsn6YpYiWiBsYLSJiTsyBybVuN8=\ngithub.com/google/go-cmp v0.7.0/go.mod h1:pXiqmnSA92OHEEa9HXL2W4E7lf9JzCmGVUdgjX3N/iU=\ngithub.com/google/gofuzz v1.0.0/go.mod h1:dBl0BpW6vV/+mYPU4Po3pmUjxk6FQPldtuIdl/M65Eg=\ngithub.com/gorilla/websocket v1.5.3 h1:saDtZ6Pbx/0u+bgYQ3q96pZgCzfhKXGPqt7kZ72aNNg=\ngithub.com/gorilla/websocket v1.5.3/go.mod h1:YR8l580nyteQvAITg2hZ9XVh4b55+EU/adAjf1fMHhE=\ngithub.com/jinzhu/inflection v1.0.0 h1:K317FqzuhWc8YvSVlFMCCUb36O/S9MCKRDI7QkRKD/E=\ngithub.com/jinzhu/inflection v1.0.0/go.mod h1:h+uFLlag+Qp1Va5pdKtLDYj+kHp5pxUVkryuEj+Srlc=\ngithub.com/jinzhu/now v1.1.5 h1:/o9tlHleP7gOFmsnYNz3RGnqzefHA47wQpKrrdTIwXQ=\ngithub.com/jinzhu/now v1.1.5/go.mod h1:d3SSVoowX0Lcu0IBviAWJpolVfI5UJVZZ7cO71lE/z8=\ngithub.com/json-iterator/go v1.1.12 h1:PV8peI4a0ysnczrg+LtxykD8LfKY9ML6u2jnxaEnrnM=\ngithub.com/json-iterator/go v1.1.12/go.mod h1:e30LSqwooZae/UwlEbR2852Gd8hjQvJoHmT4TnhNGBo=\ngithub.com/klauspost/cpuid/v2 v2.3.0 h1:S4CRMLnYUhGeDFDqkGriYKdfoFlDnMtqTiI/sFzhA9Y=\ngithub.com/klauspost/cpuid/v2 v2.3.0/go.mod h1:hqwkgyIinND0mEev00jJYCxPNVRVXFQeu1XKlok6oO0=\ngithub.com/leodido/go-urn v1.4.0 h1:WT9HwE9SGECu3lg4d/dIA+jxlljEa1/ffXKmRjqdmIQ=\ngithub.com/leodido/go-urn v1.4.0/go.mod h1:bvxc+MVxLKB4z00jd1z+Dvzr47oO32F/QSNjSBOlFxI=\ngithub.com/mattn/go-isatty v0.0.20 h1:xfD0iDuEKnDkl03q4limB+vH+GxLEtL/jb4xVJSWWEY=\ngithub.com/mattn/go-isatty v0.0.20/go.mod h1:W+V8PltTTMOvKvAeJH7IuucS94S2C6jfK/D7dTCTo3Y=\ngithub.com/modern-go/concurrent v0.0.0-20180228061459-e0a39a4cb421 h1:ZqeYNhU3OHLH3mGKHDcjJRFFRrJa6eAM5H+CtDdOsPc=\ngithub.com/modern-go/concurrent v0.0.0-20180228061459-e0a39a4cb421/go.mod h1:6dJC0mAP4ikYIbvyc7fijjWJddQyLn8Ig3JB5CqoB9Q=\ngithub.com/modern-go/reflect2 v1.0.2 h1:xBagoLtFs94CBntxluKeaWgTMpvLxC4ur3nMaC9Gz0M=\ngithub.com/modern-go/reflect2 v1.0.2/go.mod h1:yWuevngMOJpCy52FWWMvUC8ws7m/LJsjYzDa0/r8luk=\ngithub.com/pelletier/go-toml/v2 v2.2.4 h1:mye9XuhQ6gvn5h28+VilKrrPoQVanw5PMw/TB0t5Ec4=\ngithub.com/pelletier/go-toml/v2 v2.2.4/go.mod h1:2gIqNv+qfxSVS7cM2xJQKtLSTLUE9V8t9Stt+h56mCY=\ngithub.com/pmezard/go-difflib v1.0.0 h1:4DBwDE0NGyQoBHbLQYPwSUPoCMWR5BEzIk/f1lZbAQM=\ngithub.com/pmezard/go-difflib v1.0.0/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=\ngithub.com/quic-go/qpack v0.5.1 h1:giqksBPnT/HDtZ6VhtFKgoLOWmlyo9Ei6u9PqzIMbhI=\ngithub.com/quic-go/qpack v0.5.1/go.mod h1:+PC4XFrEskIVkcLzpEkbLqq1uCoxPhQuvK5rH1ZgaEg=\ngithub.com/quic-go/quic-go v0.54.0 h1:6s1YB9QotYI6Ospeiguknbp2Znb/jZYjZLRXn9kMQBg=\ngithub.com/quic-go/quic-go v0.54.0/go.mod h1:e68ZEaCdyviluZmy44P6Iey98v/Wfz6HCjQEm+l8zTY=\ngithub.com/rabbitmq/amqp091-go v1.10.0 h1:STpn5XsHlHGcecLmMFCtg7mqq0RnD+zFr4uzukfVhBw=\ngithub.com/rabbitmq/amqp091-go v1.10.0/go.mod h1:Hy4jKW5kQART1u+JkDTF9YYOQUHXqMuhrgxOEeS7G4o=\ngithub.com/stretchr/objx v0.1.0/go.mod h1:HFkY916IF+rwdDfMAkV7OtwuqBVzrE8GR6GFx+wExME=\ngithub.com/stretchr/objx v0.4.0/go.mod h1:YvHI0jy2hoMjB+UWwv71VJQ9isScKT/TqJzVSSt89Yw=\ngithub.com/stretchr/objx v0.5.0/go.mod h1:Yh+to48EsGEfYuaHDzXPcE3xhTkx73EhmCGUpEOglKo=\ngithub.com/stretchr/testify v1.3.0/go.mod h1:M5WIy9Dh21IEIfnGCwXGc5bZfKNJtfHm1UVUgZn+9EI=\ngithub.com/stretchr/testify v1.7.1/go.mod h1:6Fq8oRcR53rry900zMqJjRRixrwX3KX962/h/Wwjteg=\ngithub.com/stretchr/testify v1.8.0/go.mod h1:yNjHg4UonilssWZ8iaSj1OCr/vHnekPRkoO+kdMU+MU=\ngithub.com/stretchr/testify v1.8.1/go.mod h1:w2LPCIKwWwSfY2zedu0+kehJoqGctiVI29o6fzry7u4=\ngithub.com/stretchr/testify v1.11.1 h1:7s2iGBzp5EwR7/aIZr8ao5+dra3wiQyKjjFuvgVKu7U=\ngithub.com/stretchr/testify v1.11.1/go.mod h1:wZwfW3scLgRK+23gO65QZefKpKQRnfz6sD981Nm4B6U=\ngithub.com/twitchyliquid64/golang-asm v0.15.1 h1:SU5vSMR7hnwNxj24w34ZyCi/FmDZTkS4MhqMhdFk5YI=\ngithub.com/twitchyliquid64/golang-asm v0.15.1/go.mod h1:a1lVb/DtPvCB8fslRZhAngC2+aY1QWCk3Cedj/Gdt08=\ngithub.com/ugorji/go/codec v1.3.0 h1:Qd2W2sQawAfG8XSvzwhBeoGq71zXOC/Q1E9y/wUcsUA=\ngithub.com/ugorji/go/codec v1.3.0/go.mod h1:pRBVtBSKl77K30Bv8R2P+cLSGaTtex6fsA2Wjqmfxj4=\ngo.uber.org/goleak v1.3.0 h1:2K3zAYmnTNqV73imy9J1T3WC+gmCePx2hEGkimedGto=\ngo.uber.org/goleak v1.3.0/go.mod h1:CoHD4mav9JJNrW/WLlf7HGZPjdw8EucARQHekz1X6bE=\ngo.uber.org/mock v0.5.0 h1:KAMbZvZPyBPWgD14IrIQ38QCyjwpvVVV6K/bHl1IwQU=\ngo.uber.org/mock v0.5.0/go.mod h1:ge71pBPLYDk7QIi1LupWxdAykm7KIEFchiOqd6z7qMM=\ngolang.org/x/arch v0.20.0 h1:dx1zTU0MAE98U+TQ8BLl7XsJbgze2WnNKF/8tGp/Q6c=\ngolang.org/x/arch v0.20.0/go.mod h1:bdwinDaKcfZUGpH09BB7ZmOfhalA8lQdzl62l8gGWsk=\ngolang.org/x/crypto v0.40.0 h1:r4x+VvoG5Fm+eJcxMaY8CQM7Lb0l1lsmjGBQ6s8BfKM=\ngolang.org/x/crypto v0.40.0/go.mod h1:Qr1vMER5WyS2dfPHAlsOj01wgLbsyWtFn/aY+5+ZdxY=\ngolang.org/x/mod v0.25.0 h1:n7a+ZbQKQA/Ysbyb0/6IbB1H/X41mKgbhfv7AfG/44w=\ngolang.org/x/mod v0.25.0/go.mod h1:IXM97Txy2VM4PJ3gI61r1YEk/gAj6zAHN3AdZt6S9Ww=\ngolang.org/x/net v0.42.0 h1:jzkYrhi3YQWD6MLBJcsklgQsoAcw89EcZbJw8Z614hs=\ngolang.org/x/net v0.42.0/go.mod h1:FF1RA5d3u7nAYA4z2TkclSCKh68eSXtiFwcWQpPXdt8=\ngolang.org/x/sync v0.16.0 h1:ycBJEhp9p4vXvUZNszeOq0kGTPghopOL8q0fq3vstxw=\ngolang.org/x/sync v0.16.0/go.mod h1:1dzgHSNfp02xaA81J2MS99Qcpr2w7fw1gpm99rleRqA=\ngolang.org/x/sys v0.6.0/go.mod h1:oPkhp1MJrh7nUepCBck5+mAzfO9JrbApNNgaTdGDITg=\ngolang.org/x/sys v0.35.0 h1:vz1N37gP5bs89s7He8XuIYXpyY0+QlsKmzipCbUtyxI=\ngolang.org/x/sys v0.35.0/go.mod h1:BJP2sWEmIv4KK5OTEluFJCKSidICx8ciO85XgH3Ak8k=\ngolang.org/x/text v0.27.0 h1:4fGWRpyh641NLlecmyl4LOe6yDdfaYNrGb2zdfo4JV4=\ngolang.org/x/text v0.27.0/go.mod h1:1D28KMCvyooCX9hBiosv5Tz/+YLxj0j7XhWjpSUF7CU=\ngolang.org/x/tools v0.34.0 h1:qIpSLOxeCYGg9TrcJokLBG4KFA6d795g0xkBkiESGlo=\ngolang.org/x/tools v0.34.0/go.mod h1:pAP9OwEaY1CAW3HOmg3hLZC5Z0CCmzjAF2UQMSqNARg=\ngoogle.golang.org/protobuf v1.36.9 h1:w2gp2mA27hUeUzj9Ex9FBjsBm40zfaDtEWow293U7Iw=\ngoogle.golang.org/protobuf v1.36.9/go.mod h1:fuxRtAxBytpl4zzqUh6/eyUujkJdNiuEkXntxiD/uRU=\ngopkg.in/check.v1 v0.0.0-20161208181325-20d25e280405/go.mod h1:Co6ibVJAznAaIkqp8huTwlJQCZ016jof/cbN4VW5Yz0=\ngopkg.in/yaml.v3 v3.0.0-20200313102051-9f266ea9e77c/go.mod h1:K4uyk7z7BCEPqu6E+C64Yfv1cQ7kz7rIZviUmN+EgEM=\ngopkg.in/yaml.v3 v3.0.1 h1:fxVm/GzAzEWqLHuvctI91KS9hhNmmWOoWu0XTYJS7CA=\ngopkg.in/yaml.v3 v3.0.1/go.mod h1:K4uyk7z7BCEPqu6E+C64Yfv1cQ7kz7rIZviUmN+EgEM=\ngorm.io/driver/mysql v1.6.0 h1:eNbLmNTpPpTOVZi8MMxCi2aaIm0ZpInbORNXDwyLGvg=\ngorm.io/driver/mysql v1.6.0/go.mod h1:D/oCC2GWK3M/dqoLxnOlaNKmXz8WNTfcS9y5ovaSqKo=\ngorm.io/gorm v1.31.1 h1:7CA8FTFz/gRfgqgpeKIBcervUn3xSyPUmr6B2WXJ7kg=\ngorm.io/gorm v1.31.1/go.mod h1:XyQVbO2k6YkOis7C2437jSit3SsDK72s7n7rsSHd+Gs=\n
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/go.sum b/go.sum
+--- a/go.sum	(revision 6ed41c39989e99692294b4c7377a28def9f527cb)
++++ b/go.sum	(date 1765201508601)
+@@ -58,8 +58,6 @@
+ github.com/quic-go/qpack v0.5.1/go.mod h1:+PC4XFrEskIVkcLzpEkbLqq1uCoxPhQuvK5rH1ZgaEg=
+ github.com/quic-go/quic-go v0.54.0 h1:6s1YB9QotYI6Ospeiguknbp2Znb/jZYjZLRXn9kMQBg=
+ github.com/quic-go/quic-go v0.54.0/go.mod h1:e68ZEaCdyviluZmy44P6Iey98v/Wfz6HCjQEm+l8zTY=
+-github.com/rabbitmq/amqp091-go v1.10.0 h1:STpn5XsHlHGcecLmMFCtg7mqq0RnD+zFr4uzukfVhBw=
+-github.com/rabbitmq/amqp091-go v1.10.0/go.mod h1:Hy4jKW5kQART1u+JkDTF9YYOQUHXqMuhrgxOEeS7G4o=
+ github.com/stretchr/objx v0.1.0/go.mod h1:HFkY916IF+rwdDfMAkV7OtwuqBVzrE8GR6GFx+wExME=
+ github.com/stretchr/objx v0.4.0/go.mod h1:YvHI0jy2hoMjB+UWwv71VJQ9isScKT/TqJzVSSt89Yw=
+ github.com/stretchr/objx v0.5.0/go.mod h1:Yh+to48EsGEfYuaHDzXPcE3xhTkx73EhmCGUpEOglKo=
+@@ -73,8 +71,6 @@
+ github.com/twitchyliquid64/golang-asm v0.15.1/go.mod h1:a1lVb/DtPvCB8fslRZhAngC2+aY1QWCk3Cedj/Gdt08=
+ github.com/ugorji/go/codec v1.3.0 h1:Qd2W2sQawAfG8XSvzwhBeoGq71zXOC/Q1E9y/wUcsUA=
+ github.com/ugorji/go/codec v1.3.0/go.mod h1:pRBVtBSKl77K30Bv8R2P+cLSGaTtex6fsA2Wjqmfxj4=
+-go.uber.org/goleak v1.3.0 h1:2K3zAYmnTNqV73imy9J1T3WC+gmCePx2hEGkimedGto=
+-go.uber.org/goleak v1.3.0/go.mod h1:CoHD4mav9JJNrW/WLlf7HGZPjdw8EucARQHekz1X6bE=
+ go.uber.org/mock v0.5.0 h1:KAMbZvZPyBPWgD14IrIQ38QCyjwpvVVV6K/bHl1IwQU=
+ go.uber.org/mock v0.5.0/go.mod h1:ge71pBPLYDk7QIi1LupWxdAykm7KIEFchiOqd6z7qMM=
+ golang.org/x/arch v0.20.0 h1:dx1zTU0MAE98U+TQ8BLl7XsJbgze2WnNKF/8tGp/Q6c=
+Index: im_rabbitmq/main.go
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.BaseRevisionTextPatchEP
+<+>package main\n\nimport (\n\t\"fmt\"\n\n\t\"github.com/gin-gonic/gin\"\n\t\"github.com/yzletter/go-chatery/im_rabbitmq/mq\"\n\t\"github.com/yzletter/go-chatery/im_rabbitmq/mysql\"\n\t\"github.com/yzletter/go-chatery/im_rabbitmq/server\"\n)\n\nfunc main() {\n\tengine := gin.Default()\n\n\tmysql.InitDB()\n\tRabbitMQSvc := mq.NewRabbitMQService()\n\tUserHdl := server.NewUserHandler(RabbitMQSvc)\n\n\tengine.GET(\"/register\", UserHdl.Register)\n\tengine.GET(\"/speak\", UserHdl.Speak)\n\tif err := engine.Run(\"localhost:8081\"); err != nil {\n\t\tfmt.Println(\"服务启动失败\")\n\t\tpanic(err)\n\t}\n}\n
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/im_rabbitmq/main.go b/im_rabbitmq/main.go
+--- a/im_rabbitmq/main.go	(revision 6ed41c39989e99692294b4c7377a28def9f527cb)
++++ b/im_rabbitmq/main.go	(date 1765201513458)
+@@ -2,22 +2,26 @@
+ 
+ import (
+ 	"fmt"
++	"net/http"
++	"time"
+ 
+ 	"github.com/gin-gonic/gin"
+-	"github.com/yzletter/go-chatery/im_rabbitmq/mq"
+-	"github.com/yzletter/go-chatery/im_rabbitmq/mysql"
+-	"github.com/yzletter/go-chatery/im_rabbitmq/server"
++	"github.com/gorilla/websocket"
+ )
++
++// Http 升级器
++var upgrader = websocket.Upgrader{
++	HandshakeTimeout: 1 * time.Second,
++	ReadBufferSize:   100,
++	WriteBufferSize:  100,
++	CheckOrigin: func(r *http.Request) bool {
++		return true
++	},
++}
+ 
+ func main() {
+ 	engine := gin.Default()
+ 
+-	mysql.InitDB()
+-	RabbitMQSvc := mq.NewRabbitMQService()
+-	UserHdl := server.NewUserHandler(RabbitMQSvc)
+-
+-	engine.GET("/register", UserHdl.Register)
+-	engine.GET("/speak", UserHdl.Speak)
+ 	if err := engine.Run("localhost:8081"); err != nil {
+ 		fmt.Println("服务启动失败")
+ 		panic(err)
+Index: im_rabbitmq/common/message.go
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.BaseRevisionTextPatchEP
+<+>package common\n\n// Message 定义消息结构体\ntype Message struct {\n\tId      int    `json:\"id\" gorm:\"primaryKey\"`    // 消息的 ID, 用于排重\n\tTime    int    `json:\"time\" gorm:\"column:time\"` // 精确到微妙, 以进入 Server 的时间为准\n\tFrom    int    `json:\"from\" gorm:\"column:from\"` // 消息的发送方和接收方, 带前缀 u 或 g, 表示是单聊或群聊\n\tTo      int    `json:\"to\" gorm:\"column:to\"`\n\tContent string `json:\"content\" gorm:\"column:content\"` // 消息的内容\n}\n
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/im_rabbitmq/common/message.go b/im_rabbitmq/common/message.go
+--- a/im_rabbitmq/common/message.go	(revision 6ed41c39989e99692294b4c7377a28def9f527cb)
++++ b/im_rabbitmq/common/message.go	(date 1765201514345)
+@@ -2,9 +2,8 @@
+ 
+ // Message 定义消息结构体
+ type Message struct {
+-	Id      int    `json:"id" gorm:"primaryKey"`    // 消息的 ID, 用于排重
+-	Time    int    `json:"time" gorm:"column:time"` // 精确到微妙, 以进入 Server 的时间为准
+-	From    int    `json:"from" gorm:"column:from"` // 消息的发送方和接收方, 带前缀 u 或 g, 表示是单聊或群聊
+-	To      int    `json:"to" gorm:"column:to"`
+-	Content string `json:"content" gorm:"column:content"` // 消息的内容
++	Id       int64  // 消息的 ID, 用于排重
++	Time     int64  // 精确到微妙, 以进入 Server 的时间为准
++	From, To string // 消息的发送方和接收方, 带前缀 u 或 g, 表示是单聊或群聊
++	Content  string // 消息的内容
+ }
+Index: im_channel/server.go
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.BaseRevisionTextPatchEP
+<+>package main\n\nimport (\n\t\"bytes\"\n\t\"fmt\"\n\t\"net/http\"\n\t\"time\"\n\n\t\"github.com/gorilla/websocket\"\n)\n\nvar (\n\tnewLine = []byte{'\\n'}\n\tspace   = []byte{' '}\n)\n\ntype Server struct {\n\tsend     chan []byte // 消息管道\n\tuserName []byte      // 用户名\n\t// 绑定 Hub 和 Conn\n\thub  *Hub\n\tconn *websocket.Conn\n}\n\n// http 升级器\nvar upgrader = websocket.Upgrader{\n\tHandshakeTimeout: 1 * time.Second,\n\tReadBufferSize:   100,\n\tWriteBufferSize:  100,\n\tCheckOrigin: func(r *http.Request) bool {\n\t\treturn true\n\t},\n}\n\nfunc StartServer(hub *Hub, w http.ResponseWriter, r *http.Request) {\n\tconn, err := upgrader.Upgrade(w, r, nil) // 将 Http 升级为 WebSocket协议\n\tif err != nil {\n\t\tfmt.Printf(\"升级 http 协议失败, err : %s\\n\", err)\n\t\treturn\n\t}\n\tfmt.Printf(\"成功连接 %s\\n\", conn.RemoteAddr().String())\n\n\t// 新建一个 Server\n\tserver := &Server{\n\t\tsend: make(chan []byte, 256),\n\t\thub:  hub,\n\t\tconn: conn,\n\t}\n\n\t// 设置读写超时\n\terr1 := server.conn.SetWriteDeadline(time.Now().Add(24 * time.Hour))\n\terr2 := server.conn.SetReadDeadline(time.Now().Add(24 * time.Hour))\n\tif err1 != nil || err2 != nil {\n\t\tfmt.Printf(\"设置 Server 读写超时失败 \\n\")\n\t\treturn\n\t}\n\n\t// 向 Hub 中注册当前 Server\n\tserver.hub.register <- server\n\n\t// 开启协程\n\tgo server.Read()\n\tgo server.Write()\n}\n\n// 从 WebSocket 中读取数据, 写到 Hub 中去, 由 Hub 广播给其他 Server\nfunc (server *Server) Read() {\n\t// 收尾工作\n\tdefer func() {\n\t\tserver.hub.unRegister <- server // 注销当前 Server\n\t\tfmt.Printf(\"用户 %s 下线\\n\", server.userName)\n\t\tfmt.Printf(\"关闭连接 %s\\n\", server.conn.RemoteAddr().String())\n\t\terr := server.conn.Close() //关闭websocket管道\n\t\tif err != nil {\n\t\t\treturn\n\t\t}\n\t}()\n\n\tfor {\n\t\t// 如果前端主动断开连接，该行会报错，for循环会退出。注销server时，hub那儿会关闭server.send管道\n\t\t_, content, err := server.conn.ReadMessage()\n\t\tif err != nil {\n\t\t\tbreak\n\t\t}\n\n\t\t// 对消息进行简单的处理, 换行符用空格替代，bytes.TrimSpace把首尾连续的空格去掉\n\t\tcontent = bytes.TrimSpace(bytes.Replace(content, newLine, space, -1))\n\t\tif len(server.userName) <= 0 {\n\t\t\t// 约定第一条消息是当前用户名, 把上线消息发给其他用户\n\t\t\tserver.userName = content\n\t\t\tserver.hub.broadcast <- []byte(fmt.Sprintf(\"%s 已上线\", string(server.userName)))\n\t\t\tfmt.Println(\"写入 hub 成功\")\n\t\t} else {\n\t\t\t// 把消息前拼上用户名\n\t\t\tserver.hub.broadcast <- bytes.Join([][]byte{server.userName, content}, []byte(\":\"))\n\t\t\tfmt.Println(\"写入 hub 成功\")\n\t\t}\n\t}\n}\n\n// 读取 Hub 传来的其他 Server 发来的数据, 通过 WebSocket 返回给前端\nfunc (server *Server) Write() {\n\t// 收尾工作\n\tdefer func() {\n\t\t// 给前端写数据失败, 说明前端已经关了, 直接关闭连接\n\t\tfmt.Printf(\"关闭连接 %s\\n\", server.conn.RemoteAddr().String())\n\t\terr := server.conn.Close()\n\t\tif err != nil {\n\t\t\treturn\n\t\t}\n\t}()\n\n\tfor {\n\t\tmsg, ok := <-server.send // ok 判断管道是否还能读\n\t\tif !ok {\n\t\t\t// 管道已经不能读\n\t\t\terr := server.conn.WriteMessage(websocket.CloseMessage, []byte(\"bye bye\"))\n\t\t\tif err != nil {\n\t\t\t\treturn\n\t\t\t}\n\t\t\treturn\n\t\t} else {\n\t\t\t// 写给前端\n\t\t\terr := server.conn.WriteMessage(websocket.TextMessage, msg)\n\t\t\tif err != nil {\n\t\t\t\tfmt.Printf(\"向浏览器发送数据失败:%v\\n\", err)\n\t\t\t\treturn\n\t\t\t}\n\t\t}\n\t}\n}\n
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/im_channel/server.go b/im_channel/server.go
+--- a/im_channel/server.go	(revision 6ed41c39989e99692294b4c7377a28def9f527cb)
++++ b/im_channel/server.go	(date 1765201508601)
+@@ -22,47 +22,6 @@
+ 	conn *websocket.Conn
+ }
+ 
+-// http 升级器
+-var upgrader = websocket.Upgrader{
+-	HandshakeTimeout: 1 * time.Second,
+-	ReadBufferSize:   100,
+-	WriteBufferSize:  100,
+-	CheckOrigin: func(r *http.Request) bool {
+-		return true
+-	},
+-}
+-
+-func StartServer(hub *Hub, w http.ResponseWriter, r *http.Request) {
+-	conn, err := upgrader.Upgrade(w, r, nil) // 将 Http 升级为 WebSocket协议
+-	if err != nil {
+-		fmt.Printf("升级 http 协议失败, err : %s\n", err)
+-		return
+-	}
+-	fmt.Printf("成功连接 %s\n", conn.RemoteAddr().String())
+-
+-	// 新建一个 Server
+-	server := &Server{
+-		send: make(chan []byte, 256),
+-		hub:  hub,
+-		conn: conn,
+-	}
+-
+-	// 设置读写超时
+-	err1 := server.conn.SetWriteDeadline(time.Now().Add(24 * time.Hour))
+-	err2 := server.conn.SetReadDeadline(time.Now().Add(24 * time.Hour))
+-	if err1 != nil || err2 != nil {
+-		fmt.Printf("设置 Server 读写超时失败 \n")
+-		return
+-	}
+-
+-	// 向 Hub 中注册当前 Server
+-	server.hub.register <- server
+-
+-	// 开启协程
+-	go server.Read()
+-	go server.Write()
+-}
+-
+ // 从 WebSocket 中读取数据, 写到 Hub 中去, 由 Hub 广播给其他 Server
+ func (server *Server) Read() {
+ 	// 收尾工作
+@@ -129,3 +88,44 @@
+ 		}
+ 	}
+ }
++
++// http 升级器
++var upgrader = websocket.Upgrader{
++	HandshakeTimeout: 1 * time.Second,
++	ReadBufferSize:   100,
++	WriteBufferSize:  100,
++	CheckOrigin: func(r *http.Request) bool {
++		return true
++	},
++}
++
++func StartServer(hub *Hub, w http.ResponseWriter, r *http.Request) {
++	conn, err := upgrader.Upgrade(w, r, nil) // 将 Http 升级为 WebSocket协议
++	if err != nil {
++		fmt.Printf("升级 http 协议失败, err : %s\n", err)
++		return
++	}
++	fmt.Printf("成功连接 %s\n", conn.RemoteAddr().String())
++
++	// 新建一个 Server
++	server := &Server{
++		send: make(chan []byte, 256),
++		hub:  hub,
++		conn: conn,
++	}
++
++	// 设置读写超时
++	err1 := server.conn.SetWriteDeadline(time.Now().Add(24 * time.Hour))
++	err2 := server.conn.SetReadDeadline(time.Now().Add(24 * time.Hour))
++	if err1 != nil || err2 != nil {
++		fmt.Printf("设置 Server 读写超时失败 \n")
++		return
++	}
++
++	// 向 Hub 中注册当前 Server
++	server.hub.register <- server
++
++	// 开启协程
++	go server.Read()
++	go server.Write()
++}

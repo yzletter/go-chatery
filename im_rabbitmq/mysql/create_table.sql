@@ -10,4 +10,15 @@ create table if not exists user
 (
     id int auto_increment comment '用户 id, 自增',
     primary key (id)
-)default charset = utf8mb4 comment '用户信息表';
+) default charset = utf8mb4 comment '用户信息表';
+
+
+create table if not exists message
+(
+    id     bigint,
+    time   bigint,
+    `from` int,
+    `to`   int,
+    content varchar(100),
+    primary key (id)
+) default charset = utf8mb4 comment '消息表';
