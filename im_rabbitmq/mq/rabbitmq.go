@@ -115,8 +115,11 @@ func (mq *RabbitMQService) Consume(uid int, window chan common.Message) {
 			var message common.Message
 			_ = json.Unmarshal(deliver.Body, &message)
 
-			mysql.DB.Create(&message)
-			fmt.Printf("%d %s\n", uid, message)
+			// 由发送方写入数据库
+			if uid == message.From {
+				mysql.DB.Create(&message)
+			}
+
 			window <- message
 			deliver.Ack(false)
 		}

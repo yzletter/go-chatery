@@ -5,12 +5,8 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="ea4a8e76-9b54-446c-b888-1684f36ec905" name="更改" comment="">
-      <change beforePath="$PROJECT_DIR$/.idea/dataSources.local.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/dataSources.local.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/im_rabbitmq/main.go" beforeDir="false" afterPath="$PROJECT_DIR$/im_rabbitmq/main.go" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/im_rabbitmq/mq/rabbitmq.go" beforeDir="false" afterPath="$PROJECT_DIR$/im_rabbitmq/mq/rabbitmq.go" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/im_rabbitmq/mysql/create_table.sql" beforeDir="false" afterPath="$PROJECT_DIR$/im_rabbitmq/mysql/create_table.sql" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/im_rabbitmq/server/server.go" beforeDir="false" afterPath="$PROJECT_DIR$/im_rabbitmq/server/server.go" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
