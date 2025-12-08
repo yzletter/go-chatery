@@ -22,6 +22,47 @@ type Server struct {
 	conn *websocket.Conn
 }
 
+// http 升级器
+var upgrader = websocket.Upgrader{
+	HandshakeTimeout: 1 * time.Second,
+	ReadBufferSize:   100,
+	WriteBufferSize:  100,
+	CheckOrigin: func(r *http.Request) bool {
+		return true
+	},
+}
+
+func StartServer(hub *Hub, w http.ResponseWriter, r *http.Request) {
+	conn, err := upgrader.Upgrade(w, r, nil) // 将 Http 升级为 WebSocket协议
+	if err != nil {
+		fmt.Printf("升级 http 协议失败, err : %s\n", err)
+		return
+	}
+	fmt.Printf("成功连接 %s\n", conn.RemoteAddr().String())
+
+	// 新建一个 Server
+	server := &Server{
+		send: make(chan []byte, 256),
+		hub:  hub,
+		conn: conn,
+	}
+
+	// 设置读写超时
+	err1 := server.conn.SetWriteDeadline(time.Now().Add(24 * time.Hour))
+	err2 := server.conn.SetReadDeadline(time.Now().Add(24 * time.Hour))
+	if err1 != nil || err2 != nil {
+		fmt.Printf("设置 Server 读写超时失败 \n")
+		return
+	}
+
+	// 向 Hub 中注册当前 Server
+	server.hub.register <- server
+
+	// 开启协程
+	go server.Read()
+	go server.Write()
+}
+
 // 从 WebSocket 中读取数据, 写到 Hub 中去, 由 Hub 广播给其他 Server
 func (server *Server) Read() {
 	// 收尾工作
@@ -87,45 +128,4 @@ func (server *Server) Write() {
 			}
 		}
 	}
-}
-
-// http 升级器
-var upgrader = websocket.Upgrader{
-	HandshakeTimeout: 1 * time.Second,
-	ReadBufferSize:   100,
-	WriteBufferSize:  100,
-	CheckOrigin: func(r *http.Request) bool {
-		return true
-	},
-}
-
-func StartServer(hub *Hub, w http.ResponseWriter, r *http.Request) {
-	conn, err := upgrader.Upgrade(w, r, nil) // 将 Http 升级为 WebSocket协议
-	if err != nil {
-		fmt.Printf("升级 http 协议失败, err : %s\n", err)
-		return
-	}
-	fmt.Printf("成功连接 %s\n", conn.RemoteAddr().String())
-
-	// 新建一个 Server
-	server := &Server{
-		send: make(chan []byte, 256),
-		hub:  hub,
-		conn: conn,
-	}
-
-	// 设置读写超时
-	err1 := server.conn.SetWriteDeadline(time.Now().Add(24 * time.Hour))
-	err2 := server.conn.SetReadDeadline(time.Now().Add(24 * time.Hour))
-	if err1 != nil || err2 != nil {
-		fmt.Printf("设置 Server 读写超时失败 \n")
-		return
-	}
-
-	// 向 Hub 中注册当前 Server
-	server.hub.register <- server
-
-	// 开启协程
-	go server.Read()
-	go server.Write()
 }
