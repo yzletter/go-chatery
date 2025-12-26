@@ -6,7 +6,7 @@
     <script type="text/javascript">
         window.onload = function () {//页面打开时执行以下初始化内容
             var conn;
-            var msg = document.getElementById("msg");
+            var message = document.getElementById("message");
             var log = document.getElementById("log");
 
             function appendLog(item) {
@@ -21,11 +21,11 @@
                 if (!conn) {
                     return false;
                 }
-                if (!msg.value) {
+                if (!message.value) {
                     return false;
                 }
-                conn.send(msg.value);
-                msg.value = "";
+                conn.send(message.value);
+                message.value = "";
                 return false;
             };
 
@@ -38,7 +38,7 @@
                     appendLog(item);
                 };
                 conn.onmessage = function (evt) {//如果conn里有消息
-                    var messages = evt.data.split('\n');//用换行符分隔每条消息
+                    var messages = evt.Data.split('\n');//用换行符分隔每条消息
                     for (var i = 0; i < messages.length; i++) {
                         var item = document.createElement("div");
                         item.innerText = messages[i];//把消息逐条显示在屏幕上
@@ -169,7 +169,7 @@
             box-shadow: 0 10px 30px rgba(0, 0, 0, 0.2);
         }
 
-        #msg {
+        #message {
             flex: 1;
             font-size: 16px;
             padding: 12px 14px;
@@ -180,7 +180,7 @@
             transition: border-color 0.15s ease, box-shadow 0.15s ease, transform 0.08s ease;
         }
 
-        #msg:focus {
+        #message:focus {
             outline: none;
             border-color: var(--accent);
             box-shadow: 0 0 0 3px rgba(45, 225, 194, 0.18);
@@ -258,7 +258,7 @@
         </div>
         <div id="log"></div>
         <form id="form">
-            <input type="text" id="msg" size="100" autofocus placeholder="输入想要发送的内容..." />
+            <input type="text" id="message" size="100" autofocus placeholder="输入想要发送的内容..." />
             <input type="submit" value="发送" />
         </form>
     </main>

@@ -19,7 +19,7 @@ func InitDB() {
 		SkipDefaultTransaction: true, // 禁止在事务中进行写入操作, 性能提升约 30%
 		// 覆盖默认命名策略
 		NamingStrategy: schema.NamingStrategy{
-			SingularTable: true, // 表名映射不加复数, 仅仅是驼峰转为蛇形
+			SingularTable: false, // 表名映射不加复数, 仅仅是驼峰转为蛇形
 		},
 	}
 	db, err := gorm.Open(mysql.Open("go_chatery_tester:123456@tcp(localhost:3306)/go_chatery?charset=utf8mb4&parseTime=True&loc=Local"), gormConfig)

@@ -1,12 +1,13 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
-	"sort"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -26,6 +27,11 @@ var upgrader = websocket.Upgrader{
 	},
 }
 
+var (
+	pongWait   = 5 * time.Second //等待pong的超时时间
+	pingPeriod = 3 * time.Second //发送ping的周期，必须短于pongWait
+)
+
 type UserHandler struct {
 	RabbitMQService *mq.RabbitMQService
 }
@@ -38,101 +44,137 @@ func NewUserHandler(rabbitMQService *mq.RabbitMQService) *UserHandler {
 
 func (handler *UserHandler) Register(ctx *gin.Context) {
 	uid, _ := strconv.Atoi(ctx.Query("id"))
-	handler.RabbitMQService.RegisterUser(uid)
+	handler.RabbitMQService.Register(uid)
 }
 
 // Speak 建立 WebSocket 连接, 并不断读取消息
 func (handler *UserHandler) Speak(ctx *gin.Context) {
+	uid, _ := strconv.Atoi(ctx.Param("id"))
+
 	// 升级 Http
-	conn, err := upgrader.Upgrade(ctx.Writer, ctx.Request, nil)
+	wsConn, err := upgrader.Upgrade(ctx.Writer, ctx.Request, nil)
 	if err != nil {
 		fmt.Println(err)
 		return
 	}
 
+	// 创建可取消的子 Context
+	connCtx, cancel := context.WithCancel(ctx)
+
+	// defer 关闭连接
+	defer func() {
+		cancel()
+		fmt.Println("close websocket connection")
+		wsConn.Close()
+	}()
+
+	// 串行写 WS
+	writeCh := make(chan common.WsWriteRequest, 30)
+	send := func(message common.WsWriteRequest) bool {
+		select {
+		case <-connCtx.Done():
+			return false
+		case writeCh <- message:
+			return true
+		}
+	}
+
+	// 单独 Writer 协程写 Websocket
+	go func() {
+		defer cancel()
+		for {
+			select {
+			case <-connCtx.Done():
+				return
+			case req, ok := <-writeCh:
+				if !ok {
+					return
+				}
+				var err error
+				// 判断传入的 req
+				if req.IsJSON { // 是 JSON
+					err = wsConn.WriteJSON(req.JSONPayload)
+				} else { // 是其他
+					err = wsConn.WriteMessage(req.MessageType, req.Data)
+				}
+				if err != nil {
+					fmt.Println("Websocket write failed", "error", err)
+					return
+				}
+			}
+		}
+	}()
+
 	// 心跳保持
-	go heartBeat(conn) //心跳保持
+	go heartBeat(connCtx, wsConn, send)
 
-	uid, _ := strconv.Atoi(ctx.Param("id"))
-	targetId, _ := strconv.Atoi(ctx.Param("target"))
-
-	window := make(chan common.Message, 100)
-
-	handler.RabbitMQService.Consume(uid, targetId, window)
-
-	go handler.Receive(uid, targetId, conn, window)
-	go handler.Send(conn)
-}
-
-func (handler *UserHandler) Receive(uid int, targetId int, conn *websocket.Conn, window chan common.Message) {
-	defer func() {
-		err := conn.Close() // 错误忽略
-		if err != nil {
-			fmt.Println(err)
-			return
+	// 子程：写数据到 Websocket 中
+	go func() {
+		if err := handler.RabbitMQService.Consume(ctx, uid, send); err != nil && !errors.Is(err, context.Canceled) {
+			slog.Error("Consume MQ Failed", "error", err)
 		}
 	}()
 
-	// 拉取历史消息
-	var msgs []common.Message
-	mysql.DB.Model(&common.Message{}).Where("`from` = ? and `to` = ?", uid, targetId).Or("`from` = ? and `to` = ?", targetId, uid).Find(&msgs)
-
-	// 按时间排序
-	sort.Slice(msgs, func(i, j int) bool {
-		return msgs[i].Time > msgs[j].Time
-	})
-
-	if len(msgs) > 3 {
-		msgs = msgs[:3]
-	}
-
-	Set := make(map[common.Message]struct{})
-
-	for _, msg := range msgs {
-		Set[msg] = struct{}{}
-		printToFrontend(conn, msg)
-	}
-
-	// 从 window 中读取数据
+	// 主程：从 Websocket 中读数据打给 MQ
 	for {
-		msg := <-window
-		if _, exits := Set[msg]; !exits {
-			Set[msg] = struct{}{}
-			printToFrontend(conn, msg)
-		}
-	}
-}
-
-// Send 接受用户的消息, 打给 RabbitMQ
-func (handler *UserHandler) Send(conn *websocket.Conn) {
-	defer func() {
-		err := conn.Close() // 错误忽略
+		_, body, err := wsConn.ReadMessage()
 		if err != nil {
 			fmt.Println(err)
-			return
-		}
-	}()
-	for {
-		_, body, err := conn.ReadMessage()
-		if err != nil {
-			fmt.Println(err)
-			return
+			break
 		}
 
-		var msg common.Message
-		_ = json.Unmarshal(body, &msg)                            // 把 body 解析到 msg 中
-		msg.Content = strings.ReplaceAll(msg.Content, "\n", "  ") // 换行符用空格代替。将来要用换行符来分隔每条Message，所以一条Message内部不能出现换行符
-		msg.Id = int(time.Now().UnixMicro())
-		msg.Time = int(time.Now().UnixMicro())
+		// todo 判断消息类型，如 read_ack
 
-		ok := intercept(msg.Content) // 处理消息内容, 正常应进行对非法内容进行拦截。比如机器人消息（发言频率过快）；包含欺诈、涉政等违规内容；涉嫌私下联系/交易等。
+		// 把 body 解析到 message 中
+		var message common.Message
+		_ = json.Unmarshal(body, &message)
+
+		// 处理消息内容, 正常应进行对非法内容进行拦截。比如机器人消息（发言频率过快）；包含欺诈、涉政等违规内容；涉嫌私下联系/交易等。
+		ok := intercept(message.Content)
 		if !ok {
 			continue // 略过此条消息不发给 RabbitMQ
 		}
 
-		// 将消息分别发给 msg.To 和 msg.From
-		_ = handler.RabbitMQService.Produce(&msg, msg.To)
-		_ = handler.RabbitMQService.Produce(&msg, msg.From)
+		// 落库
+		message.Id = int(time.Now().UnixMicro())
+		message.CreatedAt = time.Now()
+		mysql.DB.Create(&message)
+
+		// todo 更新会话信息
+
+		// 将消息分别发给 MessageTo 和 MessageFrom
+		_ = handler.RabbitMQService.Produce(ctx, &message, message.MessageTo)
+		_ = handler.RabbitMQService.Produce(ctx, &message, message.MessageFrom)
+	}
+
+	cancel()
+}
+
+func heartBeat(ctx context.Context, conn *websocket.Conn, send func(common.WsWriteRequest) bool) {
+	conn.SetPongHandler(func(appData string) error {
+		return nil
+	})
+
+	// 启动 Ticker
+	ticker := time.NewTicker(pingPeriod)
+	defer ticker.Stop()
+
+	if !send(common.WsWriteRequest{MessageType: websocket.PingMessage}) {
+		return
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if !send(common.WsWriteRequest{MessageType: websocket.PingMessage}) {
+				return
+			}
+			deadline := time.Now().Add(pongWait) // ping发出去以后，期望5秒之内从conn里能计到数据（至少能读到pong）
+			conn.SetReadDeadline(deadline)
+			//fmt.Printf("must read before %s\n", deadline.Format("2006-01-02 15:04:05"))
+		}
 	}
 }
 
@@ -142,37 +184,4 @@ func intercept(content string) bool {
 		return false
 	}
 	return true
-}
-
-var (
-	pongWait   = 5 * time.Second //等待pong的超时时间
-	pingPeriod = 3 * time.Second //发送ping的周期，必须短于pongWait
-)
-
-func heartBeat(conn *websocket.Conn) {
-	conn.SetPongHandler(func(appData string) error {
-		return nil
-	})
-
-	err := conn.WriteMessage(websocket.PingMessage, nil)
-	if err != nil {
-		conn.WriteMessage(websocket.CloseMessage, nil)
-	}
-
-	ticker := time.NewTicker(pingPeriod)
-LOOP:
-	for {
-		<-ticker.C
-		err := conn.WriteMessage(websocket.PingMessage, nil)
-		if err != nil {
-			conn.WriteMessage(websocket.CloseMessage, nil)
-			break LOOP
-		}
-		deadline := time.Now().Add(pongWait) // ping发出去以后，期望5秒之内从conn里能计到数据（至少能读到pong）
-		conn.SetReadDeadline(deadline)
-	}
-}
-
-func printToFrontend(conn *websocket.Conn, msg common.Message) {
-	_ = conn.WriteJSON(msg)
 }

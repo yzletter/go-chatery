@@ -6,19 +6,24 @@ grant all on go_chatery.* to go_chatery_tester;
 -- 切到 go_postery 数据库
 use go_chatery;
 
-create table if not exists user
+CREATE TABLE IF NOT EXISTS users
 (
-    id int auto_increment comment '用户 id, 自增',
-    primary key (id)
-) default charset = utf8mb4 comment '用户信息表';
+    id BIGINT NOT NULL COMMENT '用户 ID (雪花算法)',
+    PRIMARY KEY (id)
+) DEFAULT CHARSET = utf8mb4 COMMENT '用户表';
 
 
-create table if not exists message
+CREATE TABLE IF NOT EXISTS messages
 (
-    id     bigint,
-    time   bigint,
-    `from` int,
-    `to`   int,
-    content varchar(100),
-    primary key (id)
-) default charset = utf8mb4 comment '消息表';
+    id           BIGINT   NOT NULL COMMENT 'ID',
+
+    message_from BIGINT   NOT NULL COMMENT '发送方',
+    message_to   BIGINT   NOT NULL COMMENT '接收方',
+
+    content      TEXT     NOT NULL COMMENT '消息内容',
+    created_at   DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+    updated_at   DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+    deleted_at   DATETIME          DEFAULT NULL COMMENT '逻辑删除时间',
+
+    PRIMARY KEY (id)
+) DEFAULT CHARSET = utf8mb4 COMMENT '消息记录表';

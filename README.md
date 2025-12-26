@@ -9,7 +9,7 @@
 以 User1 在群里发言为例
 ![架构图](/images/im版本一架构图.jpg)
 
-## 版本一：用 RabbitMQ 实现单聊、群聊
+## 版本二：用 RabbitMQ 实现即时聊天
 
 ### 架构图
 ![架构图](/images/im版本二架构图.jpg)
